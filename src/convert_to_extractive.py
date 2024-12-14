@@ -13,28 +13,28 @@ from time import time
 
 logger = logging.getLogger(__name__)
 
-# 步骤
-# 运行 cnn/dm 处理脚本以获取训练、测试、验证二进制文本文件
-# 对于每个 bin：
-#   加载所有数据，每行是列表中的一个条目
-#   对于每个文档（行）（并行化）：
-#       对源文件和目标文件中的行进行分词
-#       通过 oracle_id 算法处理源和目标
-#       在数据处理器中运行当前的 preprocess_examples() 函数（数据清理）
-#       返回源（作为句子列表）和目标
-#   在 map() 循环中：将每个（源、目标、标签）附加到变量，并在完成后保存（作为 cnn_dm_extractive）
+# Steps
+# Run cnn/dm processing script to get train, test, valid bin text files
+# For each bin:
+#   Load all the data where each line is an entry in a list
+#   For each document (line) (parallelized):
+#       Tokenize line in the source and target files
+#       Run source and target through oracle_id algorithm
+#       Run current preprocess_examples() function (data cleaning) in data processor
+#       Return source (as list of sentences) and target
+#   In map() loop: append each (source, target, labels) to variable and save (as cnn_dm_extractive) once done
 
-# BertSum：
-# 1. 将所有文件标记化为标记化的 json 版本
-# 2. 将 json 拆分为源和目标，并将故事连接成 `shard_size` 数量的块
-# 3. 处理以获得每个块的提取摘要和标签
-# 4. 将每个处理过的块保存为包含处理值的字典列表
+# BertSum:
+# 1. Tokenize all files into tokenized json versions
+# 2. Split json into source and target AND concat stories into chunks of `shard_size` number of stories
+# 3. Process to obtain extractive summary and labels for each shard
+# 4. Save each processed shard as list of dictionaries with processed values
 
 
 def read_in_chunks(file_object, chunk_size=5000):
     """ Read a file line by line but yield chunks of `chunk_size` number of lines at a time. """
     # https://stackoverflow.com/a/519653
-    # 从 1 开始计数，因为零对任何数的模都是零
+    # zero mod anything is zero so start counting at 1
     current_line_num = 1
     lines = []
     for line in file_object:
@@ -52,11 +52,12 @@ def read_in_chunks(file_object, chunk_size=5000):
 
 
 def convert_to_extractive_driver(args):
-    """ 驱动程序函数，将抽象摘要数据集转换为提取式数据集。
-    抽象数据集必须为每个拆分格式化为两个文件：源文件和目标文件。
-    示例文件列表：["train.source", "train.target", "val.source", "val.target"]
     """
-    # 默认情况下，如果未指定输出目录，则输出到输入数据目录
+    Driver function to convert an abstractive summarization dataset to an extractive dataset.
+    The abstractive dataset must be formatted with two files for each split: a source and target file.
+    Example file list for two splits: ["train.source", "train.target", "val.source", "val.target"]
+    """
+    # default is to output to input data directory if no output directory specified
     if not args.base_output_path:
         args.base_output_path = args.base_path
 
@@ -65,11 +66,11 @@ def convert_to_extractive_driver(args):
     # more info: https://spacy.io/usage/processing-pipelines
     nlp = spacy.load("en_core_web_sm", disable=["tagger", "ner"])
 
-    # 对于每个拆分
+    # for each split
     for name in tqdm(
         args.split_names, total=len(args.split_names), desc="Dataset Split"
     ):
-        # 获取源和目标路径
+        # get the source and target paths
         source_file_path = os.path.join(args.base_path, (name + "." + args.source_ext))
         target_file_path = os.path.join(args.base_path, (name + "." + args.target_ext))
         logger.info("Opening source and target " + str(name) + " files")
@@ -78,28 +79,28 @@ def convert_to_extractive_driver(args):
             target_file_path, "r"
         ) as target_file:
             if args.shard_interval:  # if sharding is enabled
-                # 获取要处理的示例数量
+                # get number of examples to process
                 target_file_len = sum(1 for line in target_file)
-                # 在获取长度后将指针重置回开头
+                # reset pointer back to beginning after getting length
                 target_file.seek(0)
 
-                # 找到循环将运行多长时间
+                # find how long the loop will run
                 tot_num_interations = int(target_file_len / args.shard_interval)
 
-                # 默认情况下，假设没有先前的分片（即不恢复）
+                # default is that there was no previous shard (aka not resuming)
                 last_shard = 0
                 if args.resume:
                     num_lines_read, last_shard = resume(
                         args.base_output_path, name, args.shard_interval
                     )
 
-                    # 如果已读取行并且已将分片写入磁盘
+                    # if lines have been read and shards have been written to disk
                     if num_lines_read:
                         logger.info("Resuming to line " + str(num_lines_read))
-                        # 将源和目标都寻址到下一行
+                        # seek both the source and target to the next line
                         seek_files([source_file, target_file], num_lines_read)
 
-                        # 减去已经创建的分片数量
+                        # subtract the number of shards already created
                         tot_num_interations -= int(last_shard)
                     else:  # no shards on disk
                         logger.warn("Tried to resume but no shards found on disk")
@@ -127,11 +128,12 @@ def convert_to_extractive_driver(args):
 def convert_to_extractive_process(
     args, nlp, source_docs, target_docs, name, piece_idx=None
 ):
-    """ 主过程，将抽象摘要数据集转换为提取式。
-    对源和目标文档进行分词，获取 `oracle_ids`，拆分为 `source` 和 `labels`，并保存处理后的数据。
     """
-    # 对源和目标文档进行分词
-    # 每个步骤在 `args.n_process` 线程上并行运行，批大小为 `args.batch_size`
+    Main process to convert an abstractive summarization dataset to extractive.
+    Tokenizes, gets the `oracle_ids`, splits into `source` and `labels`, and saves processed data.
+    """
+    # tokenize the source and target documents
+    # each step runs in parallel on `args.n_process` threads with batch size `args.batch_size`
     source_docs_tokenized = tokenize(
         nlp,
         source_docs,
@@ -147,7 +149,7 @@ def convert_to_extractive_process(
         name=(" " + name + "-" + args.target_ext),
     )
 
-    # 设置常量 `oracle_mode`
+    # set a constant `oracle_mode`
     _example_processor = partial(example_processor, oracle_mode=args.oracle_mode)
 
     dataset = []
@@ -159,9 +161,10 @@ def convert_to_extractive_process(
     ):
         if preprocessed_data is not None:
             # preprocessed_data is (source_doc, labels)
-            dataset.append(
-                {"src": preprocessed_data[0], "labels": preprocessed_data[1]}
-            )
+            to_append = {"src": preprocessed_data[0], "labels": preprocessed_data[1]}
+            if name in args.add_target_to:
+                to_append["tgt"] = target_docs[idx]
+            dataset.append(to_append)
 
     pool.close()
     pool.join()
@@ -177,7 +180,7 @@ def convert_to_extractive_process(
 
 
 def resume(output_path, split, chunk_size):
-    """ 查找最后创建的分片并返回读取的总行数和最后的分片编号。 """
+    """ Find the last shard created and return the total number of lines read and last shard number. """
     glob_str = os.path.join(output_path, (split + ".*.json"))
     all_json_in_split = glob.glob(glob_str)
 
@@ -199,7 +202,7 @@ def resume(output_path, split, chunk_size):
 
 
 def seek_files(files, line_num):
-    """ 将一组文件寻址到行号 `line_num` 并返回文件。 """
+    """ Seek a set of files to line number `line_num` and return the files. """
     rtn_file_objects = []
     for file_object in files:
         line_offset = []
@@ -216,7 +219,7 @@ def seek_files(files, line_num):
 
 
 def save(json_to_save, output_path, compression=False):
-    """ 保存 `json_to_save` 到 `output_path`，并根据 `compression` 指定可选的 gzip 压缩 """
+    """ Save `json_to_save` to `output_path` with optional gzip compresssion specified by `compression` """
     logger.info("Saving to " + str(output_path))
     if compression:
         # https://stackoverflow.com/a/39451012
@@ -230,7 +233,7 @@ def save(json_to_save, output_path, compression=False):
 
 
 def tokenize(nlp, docs, n_process=5, batch_size=100, name=""):
-    """ 使用 spacy 进行分词并拆分为句子和标记 """
+    """ Tokenize using spacy and split into sentences and tokens """
     tokenized = []
 
     for idx, doc in tqdm(
@@ -252,12 +255,12 @@ def tokenize(nlp, docs, n_process=5, batch_size=100, name=""):
     del doc_sents
 
     logger.info("Done in " + str(time() - t0) + " seconds")
-    # `sents` 是一个文档数组，其中每个文档是一个句子数组，每个句子是一个标记数组
+    # `sents` is an array of documents where each document is an array sentences where each sentence is an array of tokens
     return sents
 
 
 def example_processor(args, oracle_mode="greedy"):
-    """ 创建 `oracle_ids`，将其转换为 `labels` 并运行 preprocess()。 """
+    """ Create `oracle_ids`, convert them to `labels` and run preprocess(). """
     source_doc, target_doc = args
     if oracle_mode == "greedy":
         oracle_ids = greedy_selection(source_doc, target_doc, 3)
@@ -281,7 +284,7 @@ def preprocess(
     min_example_nsents=3,
     max_example_nsents=100,
 ):
-    """ 删除过长或过短的句子，并删除句子数量过少或过多的示例。 """
+    """ Removes sentences that are too long/short and examples that have too few/many sentences. """
     # pick the sentence indexes in `example` if they are larger then `min_sentence_ntokens`
     idxs = [i for i, s in enumerate(example) if (len(s) > min_sentence_ntokens)]
     # truncate selected source sentences to `max_sentence_ntokens`
@@ -448,6 +451,13 @@ if __name__ == "__main__":
         choices=["train", "val", "test"],
         nargs="+",
         help="which splits of dataset to process",
+    )
+    parser.add_argument(
+        "--add_target_to",
+        default=["test"],
+        choices=["train", "val", "test"],
+        nargs="+",
+        help="add the abstractive target to these splits (useful for calculating rouge scores)",
     )
     parser.add_argument(
         "--source_ext", type=str, default="source", help="extension of source files"

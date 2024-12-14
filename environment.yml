@@ -6,8 +6,11 @@ dependencies:
     - pytorch
     - scikit-learn
     - tensorboard
-        - spacy
-        - pip
-        - pip:
-        - pytorch_lightning
-        - transformers
+    - spacy
+    - pip
+    - pip:
+      - pytorch_lightning
+      - transformers
+      - qhoptim
+      - wandb
+      - rouge-score

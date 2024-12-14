@@ -1,76 +1,71 @@
 import torch
-from torch import Tensor
 from torch import nn
-from typing import Union, Tuple, List, Iterable, Dict
-import os
-import json
 
 
 class Pooling(nn.Module):
-    """对标记嵌入执行池化（最大或平均）。
-    
-    使用池化，从可变大小的句子生成固定大小的句子嵌入。此层还允许使用 CLS 标记（如果底层词嵌入模型返回）。
-    您可以将多个池化连接在一起。
-    """
-    def __init__(self,
-                 word_embedding_dimension: int,
-                 pooling_mode_cls_token: bool = False,
-                 pooling_mode_max_tokens: bool = False,
-                 pooling_mode_mean_tokens: bool = True,
-                 pooling_mode_mean_sqrt_len_tokens: bool = False,
-                 ):
+    def __init__(self, sent_rep_tokens=True, mean_tokens=False):
+        """Methods to obtains sentence embeddings from word vectors. Multiple methods can be specificed
+        and their results will be concatenated together. 
+        
+        Keyword Arguments:
+            sent_rep_tokens {bool} -- Use the sentence representation token vectors as sentence
+                                      embeddings. (default: {True})
+            mean_tokens {bool} -- Take the mean of all the token vectors in each sentence (default: {False})
+        """
         super(Pooling, self).__init__()
 
-        self.config_keys = ['word_embedding_dimension',  'pooling_mode_cls_token', 'pooling_mode_mean_tokens', 'pooling_mode_max_tokens', 'pooling_mode_mean_sqrt_len_tokens']
+        self.sent_rep_tokens = sent_rep_tokens
+        self.mean_tokens = mean_tokens
 
-        self.word_embedding_dimension = word_embedding_dimension
-        self.pooling_mode_cls_token = pooling_mode_cls_token
-        self.pooling_mode_mean_tokens = pooling_mode_mean_tokens
-        self.pooling_mode_max_tokens = pooling_mode_max_tokens
-        self.pooling_mode_mean_sqrt_len_tokens = pooling_mode_mean_sqrt_len_tokens
+        # pooling_mode_multiplier = sum([sent_rep_tokens, mean_tokens])
+        # self.pooling_output_dimension = (pooling_mode_multiplier * word_embedding_dimension)
 
-        pooling_mode_multiplier = sum([pooling_mode_cls_token, pooling_mode_max_tokens, pooling_mode_mean_tokens, pooling_mode_mean_sqrt_len_tokens])
-        self.pooling_output_dimension = (pooling_mode_multiplier * word_embedding_dimension)
-
-    def forward(self, token_embeddings=None, cls_token=None, input_mask=None):
-        ## 池化策略
+    def forward(
+        self,
+        word_vectors=None,
+        sent_rep_token_ids=None,
+        sent_rep_mask=None,
+        sent_lengths=None,
+        sent_lengths_mask=None,
+    ):
         output_vectors = []
-        if self.pooling_mode_cls_token:
-            output_vectors.append(cls_token)
-        if self.pooling_mode_max_tokens:
-            input_mask_expanded = input_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-            token_embeddings[input_mask_expanded == 0] = -1e9  # Set padding tokens to large negative value
-            max_over_time = torch.max(token_embeddings, 1)[0]
-            output_vectors.append(max_over_time)
-        if self.pooling_mode_mean_tokens or self.pooling_mode_mean_sqrt_len_tokens:
-            input_mask_expanded = input_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        output_masks = []
 
-            sum_mask = input_mask_expanded.sum(1)
+        if self.sent_rep_tokens:
+            sents_vec = word_vectors[
+                torch.arange(word_vectors.size(0)).unsqueeze(1), sent_rep_token_ids
+            ].squeeze()
+            sents_vec = sents_vec * sent_rep_mask[:, :, None].float()
+            output_vectors.append(sents_vec)
+            output_masks.append(sent_rep_mask)
 
-            sum_mask = torch.clamp(sum_mask, min=1e-9)
-
-            if self.pooling_mode_mean_tokens:
-                output_vectors.append(sum_embeddings / sum_mask)
-            if self.pooling_mode_mean_sqrt_len_tokens:
-                output_vectors.append(sum_embeddings / torch.sqrt(sum_mask))
+        if self.mean_tokens:
+            batch_sequences = [
+                torch.split(word_vectors[idx], seg)
+                for idx, seg in enumerate(sent_lengths)
+            ]
+            sents_list = [
+                torch.stack(
+                    [
+                        # the mean with padding ignored
+                        (sequence.sum(dim=0) / (sequence != 0).sum(dim=0))
+                        # if the sequence contains values that are not zero
+                        if ((sequence != 0).sum() != 0)
+                        # any tensor with 2 dimensions (one being the hidden size) that has already been created (will be set to zero from padding)
+                        else word_vectors[0, 0].float()
+                        # for each sentence
+                        for sequence in sequences
+                    ],
+                    dim=0,
+                )
+                for sequences in batch_sequences  # for all the sentences in each batch
+            ]
+            sents_vec = torch.stack(sents_list, dim=0)
+            sents_vec = sents_vec * sent_lengths_mask[:, :, None].float()
+            output_vectors.append(sents_vec)
+            output_masks.append(sent_lengths_mask)
 
         output_vector = torch.cat(output_vectors, 1)
-        return output_vector
+        output_mask = torch.cat(output_masks, 1)
 
-    def get_sentence_embedding_dimension(self):
-        return self.pooling_output_dimension
-
-    def get_config_dict(self):
-        return {key: self.__dict__[key] for key in self.config_keys}
-
-    def save(self, output_path):
-        with open(os.path.join(output_path, 'config.json'), 'w') as fOut:
-            json.dump(self.get_config_dict(), fOut, indent=2)
-
-    @staticmethod
-    def load(input_path):
-        with open(os.path.join(input_path, 'config.json')) as fIn:
-            config = json.load(fIn)
-
-        return Pooling(**config)
+        return output_vector, output_mask
