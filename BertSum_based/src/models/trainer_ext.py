@@ -5,7 +5,7 @@ import torch
 from tensorboardX import SummaryWriter
 
 import distributed
-from models.reporter import ReportMgr, Statistics
+from models.reporter_ext import ReportMgr, Statistics
 from others.logging import logger
 from others.utils import test_rouge, rouge_results_to_str
 
@@ -15,7 +15,7 @@ def _tally_parameters(model):
     return n_params
 
 
-def build_trainer(args, device_id, model, optims,loss):
+def build_trainer(args, device_id, model, optim):
     """
     Simplify `Trainer` creation based on user `opt`s*
     Args:
@@ -28,8 +28,6 @@ def build_trainer(args, device_id, model, optims,loss):
         model_saver(:obj:`onmt.models.ModelSaverBase`): the utility object
             used to save the model
     """
-    device = "cpu" if args.visible_gpus == '-1' else "cuda"
-
 
     grad_accum_count = args.accum_count
     n_gpu = args.world_size
@@ -48,8 +46,7 @@ def build_trainer(args, device_id, model, optims,loss):
 
     report_manager = ReportMgr(args.report_every, start_time=-1, tensorboard_writer=writer)
 
-
-    trainer = Trainer(args, model, optims, loss, grad_accum_count, n_gpu, gpu_rank, report_manager)
+    trainer = Trainer(args, model, optim, grad_accum_count, n_gpu, gpu_rank, report_manager)
 
     # print(tr)
     if (model):
@@ -84,21 +81,20 @@ class Trainer(object):
                 Thus nothing will be saved if this parameter is None
     """
 
-    def __init__(self,  args, model,  optims, loss,
-                  grad_accum_count=1, n_gpu=1, gpu_rank=1,
-                  report_manager=None):
+    def __init__(self, args, model, optim,
+                 grad_accum_count=1, n_gpu=1, gpu_rank=1,
+                 report_manager=None):
         # Basic attributes.
         self.args = args
         self.save_checkpoint_steps = args.save_checkpoint_steps
         self.model = model
-        self.optims = optims
+        self.optim = optim
         self.grad_accum_count = grad_accum_count
         self.n_gpu = n_gpu
         self.gpu_rank = gpu_rank
         self.report_manager = report_manager
 
-        self.loss = loss
-
+        self.loss = torch.nn.BCELoss(reduction='none')
         assert grad_accum_count > 0
         # Set model in training mode.
         if (model):
@@ -125,8 +121,7 @@ class Trainer(object):
         logger.info('Start training...')
 
         # step =  self.optim._step + 1
-        step =  self.optims[0]._step + 1
-
+        step = self.optim._step + 1
         true_batchs = []
         accum = 0
         normalization = 0
@@ -143,8 +138,7 @@ class Trainer(object):
                 if self.n_gpu == 0 or (i % self.n_gpu == self.gpu_rank):
 
                     true_batchs.append(batch)
-                    num_tokens = batch.tgt[:, 1:].ne(self.loss.padding_idx).sum()
-                    normalization += num_tokens.item()
+                    normalization += batch.batch_size
                     accum += 1
                     if accum == self.grad_accum_count:
                         reduce_counter += 1
@@ -159,7 +153,7 @@ class Trainer(object):
 
                         report_stats = self._maybe_report_training(
                             step, train_steps,
-                            self.optims[0].learning_rate,
+                            self.optim.learning_rate,
                             report_stats)
 
                         true_batchs = []
@@ -188,71 +182,20 @@ class Trainer(object):
         with torch.no_grad():
             for batch in valid_iter:
                 src = batch.src
-                tgt = batch.tgt
+                labels = batch.src_sent_labels
                 segs = batch.segs
                 clss = batch.clss
-                mask_src = batch.mask_src
-                mask_tgt = batch.mask_tgt
+                mask = batch.mask_src
                 mask_cls = batch.mask_cls
 
-                outputs, _ = self.model(src, tgt, segs, clss, mask_src, mask_tgt, mask_cls)
+                sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
 
-                batch_stats = self.loss.monolithic_compute_loss(batch, outputs)
+                loss = self.loss(sent_scores, labels.float())
+                loss = (loss * mask.float()).sum()
+                batch_stats = Statistics(float(loss.cpu().data.numpy()), len(labels))
                 stats.update(batch_stats)
             self._report_step(0, step, valid_stats=stats)
             return stats
-
-
-    def _gradient_accumulation(self, true_batchs, normalization, total_stats,
-                               report_stats):
-        if self.grad_accum_count > 1:
-            self.model.zero_grad()
-
-        for batch in true_batchs:
-            if self.grad_accum_count == 1:
-                self.model.zero_grad()
-
-            src = batch.src
-            tgt = batch.tgt
-            segs = batch.segs
-            clss = batch.clss
-            mask_src = batch.mask_src
-            mask_tgt = batch.mask_tgt
-            mask_cls = batch.mask_cls
-
-            outputs, scores = self.model(src, tgt,segs, clss, mask_src, mask_tgt, mask_cls)
-            batch_stats = self.loss.sharded_compute_loss(batch, outputs, self.args.generator_shard_size, normalization)
-
-            batch_stats.n_docs = int(src.size(0))
-
-            total_stats.update(batch_stats)
-            report_stats.update(batch_stats)
-
-            # 4. Update the parameters and statistics.
-            if self.grad_accum_count == 1:
-                # Multi GPU gradient gather
-                if self.n_gpu > 1:
-                    grads = [p.grad.data for p in self.model.parameters()
-                             if p.requires_grad
-                             and p.grad is not None]
-                    distributed.all_reduce_and_rescale_tensors(
-                        grads, float(1))
-
-                for o in self.optims:
-                    o.step()
-
-        # in case of multi step gradient accumulation,
-        # update only after accum batches
-        if self.grad_accum_count > 1:
-            if self.n_gpu > 1:
-                grads = [p.grad.data for p in self.model.parameters()
-                         if p.requires_grad
-                         and p.grad is not None]
-                distributed.all_reduce_and_rescale_tensors(
-                    grads, float(1))
-            for o in self.optims:
-                o.step()
-
 
     def test(self, test_iter, step, cal_lead=False, cal_oracle=False):
         """ Validate model.
@@ -260,6 +203,7 @@ class Trainer(object):
         Returns:
             :obj:`nmt.Statistics`: validation loss statistics
         """
+
         # Set model in validating mode.
         def _get_ngrams(n, text):
             ngram_set = set()
@@ -273,7 +217,7 @@ class Trainer(object):
             tri_c = _get_ngrams(3, c.split())
             for s in p:
                 tri_s = _get_ngrams(3, s.split())
-                if len(tri_c.intersection(tri_s))>0:
+                if len(tri_c.intersection(tri_s)) > 0:
                     return True
             return False
 
@@ -281,46 +225,123 @@ class Trainer(object):
             self.model.eval()
         stats = Statistics()
 
-        can_path = '%s_step%d.candidate'%(self.args.result_path,step)
+        can_path = '%s_step%d.candidate' % (self.args.result_path, step)
         gold_path = '%s_step%d.gold' % (self.args.result_path, step)
         with open(can_path, 'w') as save_pred:
             with open(gold_path, 'w') as save_gold:
                 with torch.no_grad():
                     for batch in test_iter:
+                        src = batch.src
+                        labels = batch.src_sent_labels
+                        segs = batch.segs
+                        clss = batch.clss
+                        mask = batch.mask_src
+                        mask_cls = batch.mask_cls
+
                         gold = []
                         pred = []
+
                         if (cal_lead):
                             selected_ids = [list(range(batch.clss.size(1)))] * batch.batch_size
+                        elif (cal_oracle):
+                            selected_ids = [[j for j in range(batch.clss.size(1)) if labels[i][j] == 1] for i in
+                                            range(batch.batch_size)]
+                        else:
+                            sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
+
+                            loss = self.loss(sent_scores, labels.float())
+                            loss = (loss * mask.float()).sum()
+                            batch_stats = Statistics(float(loss.cpu().data.numpy()), len(labels))
+                            stats.update(batch_stats)
+
+                            sent_scores = sent_scores + mask.float()
+                            sent_scores = sent_scores.cpu().data.numpy()
+                            selected_ids = np.argsort(-sent_scores, 1)
+                        # selected_ids = np.sort(selected_ids,1)
                         for i, idx in enumerate(selected_ids):
                             _pred = []
-                            if(len(batch.src_str[i])==0):
+                            if (len(batch.src_str[i]) == 0):
                                 continue
                             for j in selected_ids[i][:len(batch.src_str[i])]:
-                                if(j>=len( batch.src_str[i])):
+                                if (j >= len(batch.src_str[i])):
                                     continue
                                 candidate = batch.src_str[i][j].strip()
-                                _pred.append(candidate)
+                                if (self.args.block_trigram):
+                                    if (not _block_tri(candidate, _pred)):
+                                        _pred.append(candidate)
+                                else:
+                                    _pred.append(candidate)
 
                                 if ((not cal_oracle) and (not self.args.recall_eval) and len(_pred) == 3):
                                     break
 
                             _pred = '<q>'.join(_pred)
-                            if(self.args.recall_eval):
+                            if (self.args.recall_eval):
                                 _pred = ' '.join(_pred.split()[:len(batch.tgt_str[i].split())])
 
                             pred.append(_pred)
                             gold.append(batch.tgt_str[i])
 
                         for i in range(len(gold)):
-                            save_gold.write(gold[i].strip()+'\n')
+                            save_gold.write(gold[i].strip() + '\n')
                         for i in range(len(pred)):
-                            save_pred.write(pred[i].strip()+'\n')
-        if(step!=-1 and self.args.report_rouge):
+                            save_pred.write(pred[i].strip() + '\n')
+        if (step != -1 and self.args.report_rouge):
             rouges = test_rouge(self.args.temp_dir, can_path, gold_path)
             logger.info('Rouges at step %d \n%s' % (step, rouge_results_to_str(rouges)))
         self._report_step(0, step, valid_stats=stats)
 
         return stats
+
+    def _gradient_accumulation(self, true_batchs, normalization, total_stats,
+                               report_stats):
+        if self.grad_accum_count > 1:
+            self.model.zero_grad()
+
+        for batch in true_batchs:
+            if self.grad_accum_count == 1:
+                self.model.zero_grad()
+
+            src = batch.src
+            labels = batch.src_sent_labels
+            segs = batch.segs
+            clss = batch.clss
+            mask = batch.mask_src
+            mask_cls = batch.mask_cls
+
+            sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
+
+            loss = self.loss(sent_scores, labels.float())
+            loss = (loss * mask.float()).sum()
+            (loss / loss.numel()).backward()
+            # loss.div(float(normalization)).backward()
+
+            batch_stats = Statistics(float(loss.cpu().data.numpy()), normalization)
+
+            total_stats.update(batch_stats)
+            report_stats.update(batch_stats)
+
+            # 4. Update the parameters and statistics.
+            if self.grad_accum_count == 1:
+                # Multi GPU gradient gather
+                if self.n_gpu > 1:
+                    grads = [p.grad.data for p in self.model.parameters()
+                             if p.requires_grad
+                             and p.grad is not None]
+                    distributed.all_reduce_and_rescale_tensors(
+                        grads, float(1))
+                self.optim.step()
+
+        # in case of multi step gradient accumulation,
+        # update only after accum batches
+        if self.grad_accum_count > 1:
+            if self.n_gpu > 1:
+                grads = [p.grad.data for p in self.model.parameters()
+                         if p.requires_grad
+                         and p.grad is not None]
+                distributed.all_reduce_and_rescale_tensors(
+                    grads, float(1))
+            self.optim.step()
 
     def _save(self, step):
         real_model = self.model
@@ -334,7 +355,7 @@ class Trainer(object):
             'model': model_state_dict,
             # 'generator': generator_state_dict,
             'opt': self.args,
-            'optims': self.optims,
+            'optim': self.optim,
         }
         checkpoint_path = os.path.join(self.args.model_path, 'model_step_%d.pt' % step)
         logger.info("Saving checkpoint %s" % checkpoint_path)

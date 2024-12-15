@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 
 from models.neural import MultiHeadedAttention, PositionwiseFeedForward
-from models.rnn import LayerNormLSTM
 
 
 class Classifier(nn.Module):
@@ -71,9 +70,9 @@ class TransformerEncoderLayer(nn.Module):
         return self.feed_forward(out)
 
 
-class TransformerInterEncoder(nn.Module):
+class ExtTransformerEncoder(nn.Module):
     def __init__(self, d_model, d_ff, heads, dropout, num_inter_layers=0):
-        super(TransformerInterEncoder, self).__init__()
+        super(ExtTransformerEncoder, self).__init__()
         self.d_model = d_model
         self.num_inter_layers = num_inter_layers
         self.pos_emb = PositionalEncoding(dropout, d_model)
@@ -102,33 +101,3 @@ class TransformerInterEncoder(nn.Module):
 
         return sent_scores
 
-
-class RNNEncoder(nn.Module):
-
-    def __init__(self, bidirectional, num_layers, input_size,
-                 hidden_size, dropout=0.0):
-        super(RNNEncoder, self).__init__()
-        num_directions = 2 if bidirectional else 1
-        assert hidden_size % num_directions == 0
-        hidden_size = hidden_size // num_directions
-
-        self.rnn = LayerNormLSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            bidirectional=bidirectional)
-
-        self.wo = nn.Linear(num_directions * hidden_size, 1, bias=True)
-        self.dropout = nn.Dropout(dropout)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x, mask):
-        """See :func:`EncoderBase.forward()`"""
-        x = torch.transpose(x, 1, 0)
-        memory_bank, _ = self.rnn(x)
-        memory_bank = self.dropout(memory_bank) + x
-        memory_bank = torch.transpose(memory_bank, 1, 0)
-
-        sent_scores = self.sigmoid(self.wo(memory_bank))
-        sent_scores = sent_scores.squeeze(-1) * mask.float()
-        return sent_scores
